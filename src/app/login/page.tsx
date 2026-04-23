@@ -1,13 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const router = useRouter();
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -21,18 +19,18 @@ export default function LoginPage() {
         body: JSON.stringify({ password }),
       });
       if (res.ok) {
-        const next =
-          typeof window !== "undefined"
-            ? new URLSearchParams(window.location.search).get("next") || "/"
-            : "/";
-        router.push(next);
-        router.refresh();
+        // Full navigation so the browser sends the just-set cookie on the next
+        // request. router.push uses the RSC cache which doesn't always pick up
+        // a fresh HttpOnly cookie on the first hop.
+        const next = new URLSearchParams(window.location.search).get("next") || "/";
+        window.location.assign(next);
+        return; // unmounts; don't clear `busy` so the button stays in "Unlocking…"
       } else {
         setError("Incorrect password");
+        setBusy(false);
       }
     } catch {
       setError("Network error — try again");
-    } finally {
       setBusy(false);
     }
   }
