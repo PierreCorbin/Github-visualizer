@@ -1008,92 +1008,288 @@
   });
 
   /* ══════════════ Weekly digest ══════════════ */
-  function generateDigest() {
-    const shippedThisWeek = [
-      ...HISTORY.web.map((b) => ({ ...b, side: "web" })),
-      ...HISTORY.server.map((b) => ({ ...b, side: "server" })),
-    ].filter((b) => b.end <= 7);
+  function isNoisySynth(s) {
+    return /^(merge |wip[: ]|ci:|chore: *bump|bump )/i.test(s || "");
+  }
+  function groupShipped(history, side) {
+    const recent = (history || []).filter((b) => b.end <= 7);
+    const byKey = new Map();
+    for (const h of recent) {
+      const isDep = h.name.startsWith("dependabot/");
+      const key = isDep ? "__dependabot__" : h.name;
+      const display = isDep ? "dependency bumps" : h.name;
+      let group = byKey.get(key);
+      if (!group) {
+        group = {
+          side,
+          branch: display,
+          isDependabot: isDep,
+          prs: [],
+          firstMerged: Infinity,
+          lastMerged: 0,
+          oldestLifespan: 0,
+        };
+        byKey.set(key, group);
+      }
+      group.prs.push(h);
+      group.firstMerged = Math.min(group.firstMerged, h.end);
+      group.lastMerged = Math.max(group.lastMerged, h.end);
+      group.oldestLifespan = Math.max(group.oldestLifespan, h.start - h.end);
+    }
+    return [...byKey.values()]
+      .map((g) => {
+        const best = g.prs.find((p) => !isNoisySynth(p.synth) && (p.synth || "").length > 10);
+        const chosen = best || g.prs[0];
+        return {
+          ...g,
+          summary: g.isDependabot
+            ? `${g.prs.length} dep update${g.prs.length === 1 ? "" : "s"}`
+            : chosen.synth,
+          count: g.prs.length,
+          // Representative PR for linking (latest merged)
+          pr: g.prs.slice().sort((a, b) => a.end - b.end)[0],
+        };
+      })
+      .sort((a, b) => a.lastMerged - b.lastMerged);
+  }
+  function agoLabel(days) {
+    if (days <= 0) return "today";
+    if (days === 1) return "yesterday";
+    return days + "d ago";
+  }
+  function weekRangeLabel() {
+    const now = new Date(TODAY);
+    const start = new Date(TODAY - 7 * DAY_MS);
+    const opts = { month: "short", day: "numeric" };
+    return `${start.toLocaleDateString("en-US", opts)} → ${now.toLocaleDateString("en-US", opts)}`;
+  }
 
+  function generateDigestData() {
+    const shipped = {
+      web: groupShipped(HISTORY.web, "web"),
+      server: groupShipped(HISTORY.server, "server"),
+    };
     const inFlight = [
       ...DATA.web.map((b) => ({ ...b, side: "web" })),
       ...DATA.server.map((b) => ({ ...b, side: "server" })),
-    ].filter((b) => b.stage === "active");
-
+    ]
+      .filter((b) => b.stage === "active")
+      .sort((a, b) => (a.lastDays || 0) - (b.lastDays || 0));
     const stuck = [
       ...DATA.web.map((b) => ({ ...b, side: "web" })),
       ...DATA.server.map((b) => ({ ...b, side: "server" })),
-    ].filter((b) => b.stage === "stale" || (b.pr && b.pr.state === "stale"));
-
-    const overloaded = [
-      ...new Set([...DATA.web, ...DATA.server].flatMap((b) => b.authors || [])),
     ]
+      .filter((b) => b.stage === "stale" || (b.pr && b.pr.state === "stale"))
+      .sort((a, b) => (b.lastDays || 0) - (a.lastDays || 0));
+    const drift = CONTRACT_DRIFT.filter((d) => d.severity !== "ok")
+      .map((d) => ({
+        ...d,
+        unconsumed: d.changes.filter((c) => c.state === "unconsumed").length,
+        driftCount: d.changes.filter((c) => c.state === "drift").length,
+      }))
+      .sort((a, b) => (a.severity === "risk" ? -1 : 1) - (b.severity === "risk" ? -1 : 1));
+    const mergeOrder = computeMergeOrder();
+    const bottlenecks = [...new Set([...DATA.web, ...DATA.server].flatMap((b) => b.authors || []))]
       .map((a) => ({ a, load: authorLoad(a) }))
-      .filter((x) => x.load >= 4);
+      .filter((x) => x.load >= 4)
+      .sort((a, b) => b.load - a.load);
 
-    const drifts = CONTRACT_DRIFT.filter((d) => d.severity !== "ok");
-
-    let md = `# Flash repos · weekly digest\n`;
-    md += `_Generated ${new Date().toISOString().slice(0, 10)}_\n\n`;
-
-    md += `## Shipped this week\n`;
-    if (shippedThisWeek.length === 0) md += `_Nothing shipped yet this week._\n`;
-    else
-      shippedThisWeek.forEach((b) => {
-        md += `- **[${b.side}]** \`${b.name}\` (${b.pr}) — ${b.synth} _(merged ${b.end}d ago, ${b.start - b.end}d lifespan)_\n`;
-      });
-
-    md += `\n## In flight\n`;
-    if (inFlight.length === 0) md += `_No active branches._\n`;
-    else
-      inFlight.forEach((b) => {
-        md += `- **[${b.side}]** \`${b.name}\` — ${b.synth} _(↑${b.ahead} ↓${b.behind}, last ${b.last}, @${(b.authors || []).join(", ")})_\n`;
-      });
-
-    md += `\n## Stuck / needs attention\n`;
-    if (stuck.length === 0) md += `_Nothing stalled._\n`;
-    else
-      stuck.forEach((b) => {
-        md += `- **[${b.side}]** \`${b.name}\` — last commit ${b.last}, PR ${b.pr ? "#" + b.pr.n + " " + b.pr.state : "none"}\n`;
-      });
-
-    md += `\n## Cross-repo contract drift\n`;
-    if (drifts.length === 0) md += `_All contracts in sync._\n`;
-    else
-      drifts.forEach((d) => {
-        md += `- **${d.feature}** — ${d.verdict}\n`;
-        d.changes
-          .filter((c) => c.state !== "consumed")
-          .forEach((c) => {
-            md += `  - \`${c.path}\` (${c.state}, ${c.days}d)\n`;
-          });
-      });
-
-    md += `\n## Recommended merge order\n`;
-    const order = computeMergeOrder();
-    if (order.length === 0) md += `_No cross-repo sequencing needed._\n`;
-    else order.forEach((o, i) => (md += `${i + 1}. \`${o.name}\` — ${o.why}\n`));
-
-    if (overloaded.length) {
-      md += `\n## Bottlenecks\n`;
-      overloaded.forEach((o) => {
-        md += `- **@${o.a}** is on ${o.load} in-flight branches — consider rebalancing\n`;
-      });
-    }
-    return md;
+    return {
+      period: weekRangeLabel(),
+      generated: new Date(TODAY).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }),
+      shipped,
+      inFlight,
+      stuck,
+      drift,
+      mergeOrder,
+      bottlenecks,
+    };
   }
 
+  /* ──── HTML renderer for the modal ──── */
+  function shippedSectionHTML(side, groups, repoName) {
+    if (groups.length === 0) return "";
+    const prTotal = groups.reduce((a, g) => a + g.count, 0);
+    let html = `<h3><span class="dot ${side}"></span>${escAttr(repoName)} · ${prTotal} PR${prTotal === 1 ? "" : "s"} across ${groups.length} branch${groups.length === 1 ? "" : "es"}</h3>`;
+    for (const g of groups) {
+      html += `<div class="digest-row ${side}">`;
+      html += `<div class="row-top">`;
+      html += `<span class="row-branch">${escAttr(g.branch)}</span>`;
+      const countTxt = g.count > 1 ? ` · ${g.count} PRs` : ` · PR ${escAttr(g.pr.pr)}`;
+      html += `<span class="row-meta">merged ${agoLabel(g.lastMerged)}${countTxt}</span>`;
+      html += `</div>`;
+      html += `<div class="row-summary">${escAttr(g.summary)}</div>`;
+      html += `</div>`;
+    }
+    return html;
+  }
+  function renderDigestHTML(d) {
+    const shippedCount =
+      d.shipped.web.reduce((a, g) => a + g.count, 0) +
+      d.shipped.server.reduce((a, g) => a + g.count, 0);
+    const shippedAny = shippedCount > 0;
+    let html = "";
+    html += `<h1>Flash repos · weekly digest</h1>`;
+    html += `<div class="digest-period">${d.period} · generated ${d.generated}</div>`;
+
+    html += `<h2>Shipped this week <span class="count">${shippedCount} PR${shippedCount === 1 ? "" : "s"}</span></h2>`;
+    if (!shippedAny) html += `<div class="digest-empty">Nothing shipped this week yet.</div>`;
+    else {
+      html += shippedSectionHTML("web", d.shipped.web, REPOS.web);
+      html += shippedSectionHTML("server", d.shipped.server, REPOS.server);
+    }
+
+    html += `<h2>In flight <span class="count">${d.inFlight.length} active</span></h2>`;
+    if (d.inFlight.length === 0) html += `<div class="digest-empty">No active branches.</div>`;
+    else {
+      for (const b of d.inFlight) {
+        html += `<div class="digest-row ${b.side}">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">${escAttr(b.name)}</span>`;
+        html += `<span class="row-meta"><span class="ahead">↑${b.ahead}</span><span class="behind">↓${b.behind}</span>${b.last}${(b.authors || []).length ? ` · @${(b.authors || []).join(", ")}` : ""}</span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">${escAttr(b.synth)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    html += `<h2>Needs attention <span class="count">${d.stuck.length}</span></h2>`;
+    if (d.stuck.length === 0) html += `<div class="digest-empty">Nothing stalled.</div>`;
+    else {
+      for (const b of d.stuck) {
+        const prText = b.pr ? `PR #${b.pr.n} · ${b.pr.state}` : "no PR";
+        html += `<div class="digest-row warn">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">${escAttr(b.name)}</span>`;
+        html += `<span class="row-meta">last commit ${b.last} · ${prText}</span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">${escAttr(b.synth)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    html += `<h2>Cross-repo contract drift <span class="count">${d.drift.length} hazard${d.drift.length === 1 ? "" : "s"}</span></h2>`;
+    if (d.drift.length === 0) html += `<div class="digest-empty">All cross-repo contracts in sync.</div>`;
+    else {
+      for (const x of d.drift) {
+        const cls = x.severity === "risk" ? "risk" : "warn";
+        const pills = [];
+        if (x.driftCount > 0) pills.push(`<span class="drift-state-pill drift">${x.driftCount} drift</span>`);
+        if (x.unconsumed > 0) pills.push(`<span class="drift-state-pill unconsumed">${x.unconsumed} unconsumed</span>`);
+        html += `<div class="digest-row ${cls}">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">${escAttr(x.feature)}</span>`;
+        html += `<span class="row-meta"><span class="drift-state-pills">${pills.join("")}</span></span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">${escAttr(x.verdict)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    if (d.mergeOrder.length) {
+      html += `<h2>Recommended merge order</h2>`;
+      html += `<ol>`;
+      for (const o of d.mergeOrder) {
+        html += `<li><code>${escAttr(o.name)}</code> <em>· ${escAttr(o.why)}</em></li>`;
+      }
+      html += `</ol>`;
+    }
+
+    if (d.bottlenecks.length) {
+      html += `<h2>Author load</h2>`;
+      for (const b of d.bottlenecks) {
+        html += `<div class="digest-row warn">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">@${escAttr(b.a)}</span>`;
+        html += `<span class="row-meta">${b.load} in-flight branches</span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">Consider rebalancing to reduce single-contributor risk.</div>`;
+        html += `</div>`;
+      }
+    }
+    return html;
+  }
+
+  /* ──── Markdown renderer (for clipboard) ──── */
+  function renderDigestMarkdown(d) {
+    const lines = [];
+    lines.push(`# Flash repos · weekly digest`);
+    lines.push(`_${d.period} · generated ${d.generated}_`);
+    lines.push(``);
+
+    lines.push(`## Shipped this week`);
+    const anyShipped = d.shipped.web.length + d.shipped.server.length > 0;
+    if (!anyShipped) lines.push(`_Nothing shipped this week yet._`);
+    else {
+      for (const [side, groups, name] of [
+        ["web", d.shipped.web, REPOS.web],
+        ["server", d.shipped.server, REPOS.server],
+      ]) {
+        if (groups.length === 0) continue;
+        lines.push(``);
+        lines.push(`### ${name}`);
+        for (const g of groups) {
+          const pr = g.count > 1 ? `${g.count} PRs` : g.pr.pr;
+          lines.push(`- \`${g.branch}\` (${pr}) — ${g.summary} _(merged ${agoLabel(g.lastMerged)})_`);
+        }
+      }
+    }
+    lines.push(``);
+    lines.push(`## In flight`);
+    if (d.inFlight.length === 0) lines.push(`_No active branches._`);
+    else
+      for (const b of d.inFlight) {
+        lines.push(
+          `- **[${b.side}]** \`${b.name}\` — ${b.synth} _(↑${b.ahead} ↓${b.behind}, ${b.last}${(b.authors || []).length ? ", @" + (b.authors || []).join(", ") : ""})_`,
+        );
+      }
+    lines.push(``);
+    lines.push(`## Needs attention`);
+    if (d.stuck.length === 0) lines.push(`_Nothing stalled._`);
+    else
+      for (const b of d.stuck) {
+        const pr = b.pr ? `#${b.pr.n} ${b.pr.state}` : "no PR";
+        lines.push(`- **[${b.side}]** \`${b.name}\` — last commit ${b.last}, PR ${pr}`);
+      }
+    lines.push(``);
+    lines.push(`## Cross-repo contract drift`);
+    if (d.drift.length === 0) lines.push(`_All cross-repo contracts in sync._`);
+    else
+      for (const x of d.drift) {
+        const parts = [];
+        if (x.driftCount) parts.push(`${x.driftCount} drift`);
+        if (x.unconsumed) parts.push(`${x.unconsumed} unconsumed`);
+        lines.push(`- **${x.feature}** (${parts.join(", ")}) — ${x.verdict}`);
+      }
+    if (d.mergeOrder.length) {
+      lines.push(``);
+      lines.push(`## Recommended merge order`);
+      d.mergeOrder.forEach((o, i) => lines.push(`${i + 1}. \`${o.name}\` — ${o.why}`));
+    }
+    if (d.bottlenecks.length) {
+      lines.push(``);
+      lines.push(`## Author load`);
+      for (const b of d.bottlenecks) {
+        lines.push(`- **@${b.a}** — ${b.load} in-flight branches. Consider rebalancing.`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  let lastDigestData = null;
   function openDigest() {
-    document.getElementById("digest-text").value = generateDigest();
+    lastDigestData = generateDigestData();
+    document.getElementById("digest-content").innerHTML = renderDigestHTML(lastDigestData);
     openModal("digest-modal");
   }
   document.getElementById("btn-digest").addEventListener("click", openDigest);
   document.getElementById("digest-regen").addEventListener("click", () => {
-    document.getElementById("digest-text").value = generateDigest();
+    lastDigestData = generateDigestData();
+    document.getElementById("digest-content").innerHTML = renderDigestHTML(lastDigestData);
   });
   document.getElementById("digest-copy").addEventListener("click", () => {
-    const ta = document.getElementById("digest-text");
-    ta.select();
-    navigator.clipboard?.writeText(ta.value).then(() => showToast("Digest copied"));
+    const md = renderDigestMarkdown(lastDigestData || generateDigestData());
+    navigator.clipboard?.writeText(md).then(() => showToast("Markdown copied to clipboard"));
   });
 
   function showToast(msg) {

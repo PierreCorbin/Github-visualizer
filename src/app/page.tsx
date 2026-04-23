@@ -154,10 +154,10 @@ const APP_HTML = `
       </button>
     </div>
     <div class="modal-body digest-body">
-      <textarea id="digest-text" spellcheck="false"></textarea>
+      <div class="digest-content" id="digest-content"></div>
       <div class="digest-actions">
-        <button class="btn" id="digest-regen">Regenerate</button>
-        <button class="btn primary" id="digest-copy">Copy markdown</button>
+        <button class="btn" id="digest-regen">Refresh</button>
+        <button class="btn primary" id="digest-copy">Copy as markdown</button>
       </div>
     </div>
   </div>

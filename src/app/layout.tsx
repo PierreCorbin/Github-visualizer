@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Flash Repo Visualizer · v2",
+  title: "Flash Repo Visualizer",
   description: "Cross-repo branch alignment, contract drift, and merged history for Flash repos.",
 };
 
