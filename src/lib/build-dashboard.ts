@@ -70,6 +70,7 @@ export type DashboardPayload = {
   deploys: { web: number[]; server: number[] };
   plan: RoadmapPlan;
   planBackend: "vercel-kv" | "local-file";
+  isProd: boolean;
 };
 
 function stripFeaturePrefix(name: string): string {
@@ -440,5 +441,6 @@ export async function buildFullDashboard(): Promise<DashboardPayload> {
     },
     plan,
     planBackend: backendLabel(),
+    isProd: process.env.NODE_ENV === "production",
   };
 }

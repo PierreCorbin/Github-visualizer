@@ -196,7 +196,31 @@ export default async function Page() {
 
   const generatedAt = new Date(payload.generatedAt).toLocaleString();
   const dataScript = `window.__REPO_DATA__ = ${JSON.stringify(payload).replace(/</g, "\\u003c")};`;
-  const footerScript = `document.getElementById("footer-generated")?.replaceChildren(document.createTextNode(${JSON.stringify("Live · generated " + generatedAt)}));`;
+  const backendLabel = payload.planBackend === "vercel-kv" ? "Vercel KV" : "local file";
+  const missingKvOnProd = payload.isProd && payload.planBackend !== "vercel-kv";
+  const footerLine = `storage: ${backendLabel} · generated ${generatedAt}`;
+  const footerScript = `
+    (function () {
+      var el = document.getElementById("footer-generated");
+      if (el) {
+        el.textContent = ${JSON.stringify(footerLine)};
+        el.className = ${JSON.stringify(missingKvOnProd ? "storage-bad" : "storage-ok")};
+      }
+      ${
+        missingKvOnProd
+          ? `
+        var warn = document.createElement("div");
+        warn.className = "storage-warning";
+        warn.innerHTML = '⚠ Roadmap drags are <strong>not being saved</strong> on this deployment. Your team won\\'t see each other\\'s changes. ' +
+          '<a href="https://vercel.com/docs/storage/vercel-kv/quickstart" target="_blank" rel="noreferrer">Provision Vercel KV</a> and redeploy.' +
+          '<button class="close-warning" title="Dismiss">✕</button>';
+        document.body.insertBefore(warn, document.body.firstChild);
+        warn.querySelector(".close-warning").addEventListener("click", function () { warn.remove(); });
+      `
+          : ""
+      }
+    })();
+  `;
 
   return (
     <>

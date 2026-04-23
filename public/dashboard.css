@@ -839,6 +839,27 @@ footer.legend .tips span { display: flex; align-items: center; gap: 6px; }
   font-size: 13px;
 }
 
+/* Persistence warning banner (shown when roadmap isn't being saved) */
+.storage-warning {
+  position: fixed; top: 0; left: 0; right: 0;
+  z-index: 9900;
+  background: linear-gradient(180deg, #7f1d1d, #641616);
+  color: #fecaca;
+  padding: 10px 20px;
+  text-align: center;
+  font-size: 12.5px;
+  font-weight: 500;
+  border-bottom: 1px solid rgba(239,68,68,0.4);
+  box-shadow: 0 4px 16px rgba(239,68,68,0.2);
+}
+.storage-warning a { color: #fff; text-decoration: underline; }
+.storage-warning .close-warning {
+  background: transparent; border: 0; color: #fecaca; cursor: pointer;
+  margin-left: 14px; font-size: 14px; padding: 0 4px;
+}
+footer.legend .storage-ok { color: var(--muted); font-family: var(--font-mono); font-size: 11px; }
+footer.legend .storage-bad { color: var(--rose); font-family: var(--font-mono); font-size: 11px; font-weight: 500; }
+
 /* ───── Login screen ───── */
 .login-page {
   min-height: 100vh;

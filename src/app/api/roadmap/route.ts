@@ -16,25 +16,38 @@ export async function PUT(req: Request) {
   } catch {
     return NextResponse.json({ error: "invalid JSON" }, { status: 400 });
   }
-  // Per-card update: { id, day } where day can be null to remove
-  if (body && typeof body === "object" && "id" in body) {
-    const { id, day } = body as { id: string; day: number | null };
-    if (typeof id !== "string" || (day !== null && typeof day !== "number")) {
-      return NextResponse.json({ error: "id must be string, day must be number or null" }, { status: 400 });
-    }
-    const plan = await setDay(id, day);
-    return NextResponse.json({ plan });
-  }
-  // Whole-plan replace: object map { [id]: day }
-  if (body && typeof body === "object" && !Array.isArray(body)) {
-    const map = body as Record<string, number>;
-    for (const [k, v] of Object.entries(map)) {
-      if (typeof k !== "string" || typeof v !== "number") {
-        return NextResponse.json({ error: "plan values must be numbers" }, { status: 400 });
+  try {
+    // Per-card update: { id, day } where day can be null to remove
+    if (body && typeof body === "object" && "id" in body) {
+      const { id, day } = body as { id: string; day: number | null };
+      if (typeof id !== "string" || (day !== null && typeof day !== "number")) {
+        return NextResponse.json({ error: "id must be string, day must be number or null" }, { status: 400 });
       }
+      const plan = await setDay(id, day);
+      return NextResponse.json({ plan });
     }
-    await writePlan(map);
-    return NextResponse.json({ plan: map });
+    // Whole-plan replace: object map { [id]: day }
+    if (body && typeof body === "object" && !Array.isArray(body)) {
+      const map = body as Record<string, number>;
+      for (const [k, v] of Object.entries(map)) {
+        if (typeof k !== "string" || typeof v !== "number") {
+          return NextResponse.json({ error: "plan values must be numbers" }, { status: 400 });
+        }
+      }
+      await writePlan(map);
+      return NextResponse.json({ plan: map });
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[roadmap] save failed:", msg);
+    return NextResponse.json(
+      {
+        error:
+          "Couldn't persist roadmap. If you're on Vercel, provision Vercel KV and redeploy: " +
+          msg,
+      },
+      { status: 500 },
+    );
   }
   return NextResponse.json({ error: "expected { id, day } or { [id]: day }" }, { status: 400 });
 }
