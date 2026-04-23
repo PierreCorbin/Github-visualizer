@@ -839,6 +839,70 @@ footer.legend .tips span { display: flex; align-items: center; gap: 6px; }
   font-size: 13px;
 }
 
+/* ───── Login screen ───── */
+.login-page {
+  min-height: 100vh;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+}
+.login-form {
+  width: 100%;
+  max-width: 360px;
+  display: flex; flex-direction: column; gap: 14px;
+  padding: 28px 26px 26px;
+  background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
+  border: 1px solid var(--border-strong);
+  border-radius: 16px;
+  box-shadow: 0 30px 70px rgba(0,0,0,0.55);
+}
+.login-brand { display: flex; gap: 14px; align-items: center; margin-bottom: 6px; }
+.login-mark {
+  width: 42px; height: 42px; border-radius: 11px;
+  background: linear-gradient(135deg, #8b5cf6, #6366f1);
+  display: grid; place-items: center;
+  box-shadow: 0 8px 24px rgba(139, 92, 246, 0.35);
+  flex-shrink: 0;
+}
+.login-mark svg { width: 20px; height: 20px; color: white; }
+.login-brand h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: -0.005em; }
+.login-brand p { font-size: 12px; margin: 3px 0 0; color: var(--muted); line-height: 1.4; }
+.login-form input[type="password"] {
+  width: 100%;
+  padding: 11px 14px;
+  border-radius: 8px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.12s, background 0.12s;
+}
+.login-form input[type="password"]:focus {
+  border-color: var(--accent-line);
+  background: var(--bg-2);
+}
+.login-form button {
+  padding: 11px 14px;
+  border-radius: 8px;
+  border: 0;
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--accent), #6366f1);
+  color: white;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  font-family: inherit;
+  transition: opacity 0.12s, transform 0.04s;
+}
+.login-form button:hover:not(:disabled) { opacity: 0.95; }
+.login-form button:active:not(:disabled) { transform: translateY(1px); }
+.login-form button:disabled { opacity: 0.4; cursor: not-allowed; }
+.login-error {
+  font-size: 12px; color: var(--rose);
+  text-align: center; margin-top: 2px;
+}
+
 /* Deploy marker */
 .deploy-flag {
   fill: var(--accent-2); stroke: var(--bg-0); stroke-width: 1.5;
