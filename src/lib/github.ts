@@ -36,6 +36,34 @@ export type GhPull = {
   base: string;
   user: { login: string; avatar: string };
   updated_at: string;
+  body: string;
+};
+
+export type GhIssue = {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  url: string;
+  body: string;
+  labels: { name: string; color: string }[];
+  assignees: { login: string; avatar: string | null }[];
+  createdAt: string;
+  updatedAt: string;
+  closedAt: string | null;
+  user: { login: string; avatar: string | null };
+};
+
+export type GhCheck = {
+  name: string;
+  status: string; // queued | in_progress | completed
+  conclusion: string | null; // success | failure | neutral | cancelled | skipped | timed_out | action_required
+  url: string;
+};
+
+export type GhCombinedStatus = {
+  state: "success" | "pending" | "failure" | "error";
+  total_count: number;
+  statuses: { context: string; state: string; target_url?: string }[];
 };
 
 const token = () => {
@@ -138,7 +166,85 @@ export async function listPulls(repo: string): Promise<GhPull[]> {
     base: p.base?.ref,
     user: { login: p.user?.login, avatar: p.user?.avatar_url },
     updated_at: p.updated_at,
+    body: p.body ?? "",
   }));
+}
+
+/** Open GitHub issues for a repo. Excludes PRs (GitHub's /issues endpoint returns both).
+ * Returns null when the token lacks issue-read permission so the caller can degrade gracefully. */
+export async function listIssues(
+  repo: string,
+  state: "open" | "closed" | "all" = "open",
+): Promise<GhIssue[] | null> {
+  let data: any[];
+  try {
+    data = await gh<any[]>(
+      `/repos/${owner()}/${repo}/issues?state=${state}&per_page=100&sort=updated&direction=desc`,
+      { noCache: true },
+    );
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // 403 "Resource not accessible by personal access token" → token lacks issues:read
+    if (/\b403\b/.test(msg) || /not accessible/i.test(msg)) return null;
+    throw e;
+  }
+  return data
+    .filter((i) => !i.pull_request) // issues endpoint returns PRs too; skip them
+    .map((i) => ({
+      number: i.number,
+      title: i.title,
+      state: i.state,
+      url: i.html_url,
+      body: i.body ?? "",
+      labels: (i.labels ?? []).map((l: any) =>
+        typeof l === "string"
+          ? { name: l, color: "7d7d8f" }
+          : { name: l.name, color: l.color ?? "7d7d8f" },
+      ),
+      assignees: (i.assignees ?? []).map((a: any) => ({
+        login: a.login,
+        avatar: a.avatar_url ?? null,
+      })),
+      createdAt: i.created_at,
+      updatedAt: i.updated_at,
+      closedAt: i.closed_at ?? null,
+      user: { login: i.user?.login ?? "unknown", avatar: i.user?.avatar_url ?? null },
+    }));
+}
+
+/** Combined status (legacy) for a commit SHA. */
+export async function getCombinedStatus(repo: string, sha: string): Promise<GhCombinedStatus | null> {
+  try {
+    const data = await gh<any>(`/repos/${owner()}/${repo}/commits/${sha}/status`);
+    return {
+      state: data.state,
+      total_count: data.total_count ?? 0,
+      statuses: (data.statuses ?? []).map((s: any) => ({
+        context: s.context,
+        state: s.state,
+        target_url: s.target_url,
+      })),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Check runs (modern GitHub Actions / third-party checks) for a SHA. */
+export async function getCheckRuns(repo: string, sha: string): Promise<GhCheck[]> {
+  try {
+    const data = await gh<any>(
+      `/repos/${owner()}/${repo}/commits/${sha}/check-runs?per_page=50`,
+    );
+    return (data.check_runs ?? []).map((c: any) => ({
+      name: c.name,
+      status: c.status,
+      conclusion: c.conclusion,
+      url: c.html_url,
+    }));
+  } catch {
+    return [];
+  }
 }
 
 export async function getRepoMeta(repo: string) {

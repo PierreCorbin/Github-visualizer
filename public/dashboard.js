@@ -17,6 +17,7 @@
   const CONTRACT_DRIFT = payload.contractDrift;
   const DEPLOYS = payload.deploys;
   const REPOS = payload.repos;
+  const ISSUES = payload.issues || { web: [], server: [], topLabels: [], available: false };
 
   /* ══════════════ Utilities ══════════════ */
   function escAttr(s) {
@@ -75,6 +76,11 @@
     return ordered.slice(0, 3).map((name) => ({ name, why: "shared-file dependency" }));
   }
 
+  function ciCoverage() {
+    const all = [...DATA.web, ...DATA.server];
+    const withCi = all.filter((b) => b.ci && b.ci.state !== "none");
+    return { withCi: withCi.length, total: all.length };
+  }
   function renderInsights() {
     const order = computeMergeOrder();
     const orderHtml = order.length
@@ -167,6 +173,17 @@
       </div>`,
       )
       .join("");
+    // Hint banner if no CI data — usually means token lacks Checks: Read.
+    const cov = ciCoverage();
+    const hint = document.getElementById("ci-coverage-hint");
+    if (hint) {
+      if (cov.withCi === 0 && cov.total > 0) {
+        hint.style.display = "block";
+        hint.innerHTML = `Rollout-readiness: no CI signals were retrieved for any branch. If your repos do run CI, your GitHub token may need <code>Checks: Read</code> &amp; <code>Commit statuses: Read</code> permissions.`;
+      } else {
+        hint.style.display = "none";
+      }
+    }
   }
 
   /* ══════════════ Timeline layout ══════════════ */
@@ -326,6 +343,27 @@
     return sig.join("");
   }
 
+  function readinessPill(r) {
+    if (!r) return "";
+    const cls = r.verdict === "ready" ? "ready"
+      : r.verdict === "ship-able" ? "shipable"
+      : r.verdict === "failing" ? "failing"
+      : r.verdict === "pending" ? "pending"
+      : "unknown";
+    // Skip the icon prefix entirely for "unknown" so we don't get a lonely "·".
+    const icon = r.verdict === "ready" ? "✓ "
+      : r.verdict === "failing" ? "✕ "
+      : r.verdict === "pending" ? "⏳ "
+      : r.verdict === "ship-able" ? "● "
+      : "";
+    return `<span class="readiness-pill ${cls}" title="${escAttr(r.label)}">${icon}${escAttr(r.label)}</span>`;
+  }
+  function linkedIssuesBadge(b) {
+    const ids = (b.linkedIssues || []).filter(Boolean);
+    if (!ids.length) return "";
+    const label = ids.length === 1 ? `#${ids[0]}` : `${ids.length} issues`;
+    return `<span class="issue-link-badge" data-link-issues="${ids.join(',')}" title="Open linked issue${ids.length > 1 ? 's' : ''}: ${ids.map(n => '#' + n).join(', ')}">⊕ ${escAttr(label)}</span>`;
+  }
   function prBadge(pr) {
     if (!pr) return "";
     const n = pr.n;
@@ -377,7 +415,11 @@
           <span><span class="ahead">↑${b.ahead}</span> · <span class="behind">↓${b.behind}</span> · ${b.files} files</span>
           <span>${b.last}</span>
         </div>
-        ${b.feature ? `<span class="feature-tag" data-feature="${b.feature}">${b.feature}</span>` : ""}
+        <div class="signal-row">
+          ${readinessPill(b.readiness)}
+          ${linkedIssuesBadge(b)}
+          ${b.feature ? `<span class="feature-tag" data-feature="${b.feature}">${b.feature}</span>` : ""}
+        </div>
         <div class="bottom-row">
           <div class="authors">${(b.authors || []).map(avatarEl).join("")}</div>
           <div style="display:flex;gap:4px;align-items:center;flex-wrap:wrap;justify-content:flex-end">
@@ -392,6 +434,15 @@
         tag.addEventListener("click", (e) => {
           e.stopPropagation();
           openFeatureModal(tag.dataset.feature);
+        });
+      });
+      el.querySelectorAll(".issue-link-badge").forEach((badge) => {
+        badge.addEventListener("pointerdown", (e) => e.stopPropagation());
+        badge.addEventListener("click", (e) => {
+          e.stopPropagation();
+          const ids = (badge.dataset.linkIssues || "").split(",").map(Number).filter(Boolean);
+          if (ids.length === 1) openIssueModalByNumber(ids[0]);
+          else if (ids.length > 1) openIssueModalByNumber(ids[0]);
         });
       });
       el.querySelectorAll("a").forEach((a) => {
@@ -894,6 +945,253 @@
     });
   }
 
+  /* ══════════════ Issues hub ══════════════ */
+  let issuesSideFilter = "all"; // all | web | server
+  const issuesActiveLabels = new Set();
+  let issuesSearch = "";
+
+  function issuePillStyle(label) {
+    // Always render text in the label color; tinted background. Boost saturation
+    // slightly for very dark labels so they're readable on the dark canvas.
+    const hex = (label.color || "7d7d8f").replace(/[^0-9a-f]/gi, "").padEnd(6, "0").slice(0, 6);
+    let r = parseInt(hex.slice(0, 2), 16);
+    let g = parseInt(hex.slice(2, 4), 16);
+    let b = parseInt(hex.slice(4, 6), 16);
+    const lum = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+    // For very dark labels, lift the text color so it reads on dark bg
+    if (lum < 0.35) {
+      const lift = 0.35 / Math.max(lum, 0.05);
+      r = Math.min(255, Math.round(r * lift + 80));
+      g = Math.min(255, Math.round(g * lift + 80));
+      b = Math.min(255, Math.round(b * lift + 80));
+    }
+    return `background: rgba(${r},${g},${b},0.14); border-color: rgba(${r},${g},${b},0.45); color: rgb(${r},${g},${b});`;
+  }
+  function ageLabel(days) {
+    if (days <= 0) return "today";
+    if (days < 30) return `${Math.round(days)}d`;
+    if (days < 365) return `${Math.round(days / 30)}mo`;
+    return `${(days / 365).toFixed(1)}y`;
+  }
+  function getAllIssues() {
+    if (issuesSideFilter === "web") return ISSUES.web;
+    if (issuesSideFilter === "server") return ISSUES.server;
+    return [...ISSUES.web, ...ISSUES.server];
+  }
+  function filteredIssues() {
+    const q = issuesSearch.trim().toLowerCase();
+    return getAllIssues().filter((i) => {
+      if (issuesActiveLabels.size > 0) {
+        const names = i.labels.map((l) => l.name);
+        const hasAny = [...issuesActiveLabels].some((sel) => names.includes(sel));
+        if (!hasAny) return false;
+      }
+      if (q) {
+        if (
+          !i.title.toLowerCase().includes(q) &&
+          !String(i.number).includes(q)
+        )
+          return false;
+      }
+      return true;
+    });
+  }
+
+  function renderIssueLabelChips() {
+    const wrap = document.getElementById("issues-label-chips");
+    if (!wrap) return;
+    if (!ISSUES.available || ISSUES.topLabels.length === 0) {
+      wrap.innerHTML = "";
+      return;
+    }
+    wrap.innerHTML = ISSUES.topLabels
+      .map((name) => {
+        const active = issuesActiveLabels.has(name);
+        // Find a representative color
+        const sample =
+          [...ISSUES.web, ...ISSUES.server]
+            .flatMap((i) => i.labels)
+            .find((l) => l.name === name) || { color: "7d7d8f" };
+        return `<span class="label-chip ${active ? "active" : ""}" data-label="${escAttr(name)}"><span class="swatch" style="background:#${escAttr(sample.color)}"></span>${escAttr(name)}</span>`;
+      })
+      .join("");
+    wrap.querySelectorAll(".label-chip").forEach((chip) => {
+      chip.addEventListener("click", () => {
+        const n = chip.dataset.label;
+        if (issuesActiveLabels.has(n)) issuesActiveLabels.delete(n);
+        else issuesActiveLabels.add(n);
+        renderIssueLabelChips();
+        renderIssues();
+      });
+    });
+  }
+
+  function issueCardHTML(i) {
+    const labels = i.labels
+      .slice(0, 4)
+      .map((l) => `<span class="issue-pill" style="${issuePillStyle(l)}">${escAttr(l.name)}</span>`)
+      .join("");
+    const more = i.labels.length > 4 ? ` <span class="issue-pill" style="border-color:var(--border); color:var(--muted)">+${i.labels.length - 4}</span>` : "";
+    const assignees = (i.assignees || []).slice(0, 3).map((a) =>
+      avatarEl(initialsFromLogin(a.login))
+    ).join("");
+    const linkCount = (i.linkedBranches || []).length;
+    const stale = i.daysSinceUpdate > 30;
+    return `
+      <div class="issue-card ${i.side}" data-issue-number="${i.number}" data-issue-side="${i.side}">
+        <div class="issue-top">
+          <span class="issue-num">#${i.number}</span>
+          <span class="${stale ? "issue-stale" : ""}" title="updated ${ageLabel(i.daysSinceUpdate)} ago · opened ${ageLabel(i.daysOld)} ago">
+            ${stale ? "⚠ " : ""}updated ${ageLabel(i.daysSinceUpdate)} ago
+          </span>
+        </div>
+        <div class="issue-title">${escAttr(i.title)}</div>
+        <div class="issue-labels">${labels}${more}</div>
+        <div class="issue-foot">
+          <div class="issue-assignees">${assignees || `<span style="color:var(--muted);font-size:11px">unassigned</span>`}</div>
+          ${linkCount ? `<span class="issue-link-count" title="Linked branches">⊕ ${linkCount} branch${linkCount === 1 ? "" : "es"}</span>` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  function initialsFromLogin(login) {
+    if (!login) return "??";
+    const cleaned = login.replace(/[^A-Za-z]/g, "");
+    return (cleaned.slice(0, 2) || login.slice(0, 2)).toUpperCase();
+  }
+
+  function renderIssues() {
+    const grid = document.getElementById("issues-grid");
+    const empty = document.getElementById("issues-empty");
+    const stats = document.getElementById("issues-stats");
+    if (!grid || !empty || !stats) return;
+    if (!ISSUES.available) {
+      grid.innerHTML = "";
+      empty.style.display = "block";
+      empty.className = "issues-empty warn";
+      empty.innerHTML = `
+        Issues view unavailable — your GitHub token can't read issues on these repos.<br/>
+        <span style="font-size:12px;color:var(--muted)">Edit your fine-grained PAT at <a href="https://github.com/settings/tokens" target="_blank" style="color:var(--accent-2)">github.com/settings/tokens</a> and add <code>Issues: Read</code> for the configured repos, then redeploy.</span>
+      `;
+      stats.textContent = "—";
+      return;
+    }
+    const list = filteredIssues();
+    const total = ISSUES.web.length + ISSUES.server.length;
+    const linkedCount = list.filter((i) => i.linkedBranches.length > 0).length;
+    stats.innerHTML = `<strong>${list.length}</strong> of ${total} open · ${linkedCount} linked to a branch`;
+
+    if (list.length === 0) {
+      grid.innerHTML = "";
+      empty.style.display = "block";
+      empty.className = "issues-empty";
+      empty.innerHTML = "No issues match your filter.";
+      return;
+    }
+    empty.style.display = "none";
+    grid.innerHTML = list.map(issueCardHTML).join("");
+    grid.querySelectorAll(".issue-card").forEach((card) => {
+      card.addEventListener("click", () => {
+        openIssueModalByNumber(Number(card.dataset.issueNumber), card.dataset.issueSide);
+      });
+    });
+  }
+
+  function findIssueByNumber(num, sideHint) {
+    if (sideHint === "web" || sideHint === "server") {
+      const found = ISSUES[sideHint].find((i) => i.number === num);
+      if (found) return found;
+    }
+    return ISSUES.web.find((i) => i.number === num) || ISSUES.server.find((i) => i.number === num);
+  }
+  function openIssueModalByNumber(num, sideHint) {
+    const issue = findIssueByNumber(num, sideHint);
+    if (!issue) return;
+    document.getElementById("issue-modal-title").textContent = `${issue.side === "web" ? REPOS.web : REPOS.server} · Issue #${issue.number}`;
+    const labels = issue.labels.map((l) => `<span class="issue-pill" style="${issuePillStyle(l)}">${escAttr(l.name)}</span>`).join(" ");
+    const assignees = (issue.assignees || []).map((a) => avatarEl(initialsFromLogin(a.login))).join("");
+    const linkRows = (issue.linkedBranches || [])
+      .map((lb) => {
+        const onRoadmap = [...DATA.web, ...DATA.server].find((b) => b.id === lb.id);
+        const meta = onRoadmap
+          ? `↑${onRoadmap.ahead || 0} · ${onRoadmap.last}`
+          : `<span style="color:var(--muted)">not on roadmap</span>`;
+        // Only allow scroll-and-flash for branches actually rendered on the timeline.
+        if (onRoadmap) {
+          return `<a class="issue-link-row ${lb.side}" href="#" data-link-branch-id="${lb.id}" title="Click to focus on the roadmap">
+            <span class="stage ${lb.stage}"></span>
+            <span class="name">${escAttr(lb.name)}</span>
+            <span class="meta">${meta}</span>
+          </a>`;
+        }
+        return `<div class="issue-link-row ${lb.side}" style="opacity:0.6;cursor:default" title="This branch is tracked but not visible on the roadmap">
+          <span class="stage ${lb.stage}"></span>
+          <span class="name">${escAttr(lb.name)}</span>
+          <span class="meta">${meta}</span>
+        </div>`;
+      })
+      .join("");
+    const prRefs = issue.linkedPRs?.length
+      ? `<div style="font-size:12px;color:var(--muted);margin-top:6px">Referenced by PR${issue.linkedPRs.length === 1 ? "" : "s"}: ${issue.linkedPRs.map((n) => "#" + n).join(", ")}</div>`
+      : "";
+    const body = `
+      <div class="drill-section" style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap">
+        <div style="flex:1;min-width:240px">
+          <div style="font-size:14.5px;font-weight:500;color:var(--text);margin-bottom:6px;line-height:1.35">${escAttr(issue.title)}</div>
+          <div style="font-family:var(--font-mono);font-size:11px;color:var(--muted)">opened ${ageLabel(issue.daysOld)} ago by ${escAttr(issue.author?.login || "unknown")} · updated ${ageLabel(issue.daysSinceUpdate)} ago</div>
+          ${prRefs}
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <div class="issue-assignees" style="display:flex">${assignees}</div>
+          <a class="btn" href="${escAttr(issue.url)}" target="_blank" rel="noreferrer">Open on GitHub →</a>
+        </div>
+      </div>
+      ${labels ? `<div class="drill-section"><h4>Labels</h4><div style="display:flex;gap:6px;flex-wrap:wrap">${labels}</div></div>` : ""}
+      <div class="drill-section">
+        <h4>Linked branches</h4>
+        ${linkRows ? `<div class="issue-link-list">${linkRows}</div>` : `<div class="drill-empty">No branches reference this issue. PR descriptions can use <code>Closes #${issue.number}</code> to link them.</div>`}
+      </div>
+      <div class="drill-section">
+        <h4>Description</h4>
+        <div class="issue-body-preview">${escAttr(issue.body || "(no description)")}</div>
+      </div>
+    `;
+    document.getElementById("issue-modal-body").innerHTML = body;
+    // Wire the linked-branch links to scroll-and-flash the card on the timeline
+    document.querySelectorAll("#issue-modal-body [data-link-branch-id]").forEach((a) => {
+      a.addEventListener("click", (e) => {
+        e.preventDefault();
+        const id = a.getAttribute("data-link-branch-id");
+        closeModal("issue-modal");
+        if (id) {
+          // Scroll the page so the user sees the card flash on the roadmap
+          document.getElementById("timeline-frame")?.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
+          // Wait for scroll to settle so selectCard's horizontal scroll lands on a stable layout
+          setTimeout(() => selectCard(id), 250);
+        }
+      });
+    });
+    openModal("issue-modal");
+  }
+
+  // Wire the side filter + search input
+  document.querySelectorAll("#issues-side-controls button").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll("#issues-side-controls button").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+      issuesSideFilter = btn.dataset.issueSide;
+      renderIssues();
+    });
+  });
+  document.getElementById("issues-search")?.addEventListener("input", (e) => {
+    issuesSearch = e.target.value || "";
+    renderIssues();
+  });
+
   /* ══════════════ Feature modal ══════════════ */
   function openFeatureModal(feature) {
     const w = DATA.web.find((b) => b.feature === feature);
@@ -1069,6 +1367,25 @@
       web: groupShipped(HISTORY.web, "web"),
       server: groupShipped(HISTORY.server, "server"),
     };
+    const allBranches = [
+      ...DATA.web.map((b) => ({ ...b, side: "web" })),
+      ...DATA.server.map((b) => ({ ...b, side: "server" })),
+    ];
+    // "Ready" = CI green + tests present. Everything else lands elsewhere.
+    const readyToShip = allBranches.filter(
+      (b) => b.readiness && b.readiness.verdict === "ready",
+    );
+    const tentative = allBranches.filter(
+      (b) => b.readiness && b.readiness.verdict === "ship-able",
+    );
+    const blocked = allBranches.filter(
+      (b) => b.readiness && (b.readiness.verdict === "failing" || b.readiness.verdict === "pending"),
+    );
+    const openIssues = ISSUES.available
+      ? [...ISSUES.web, ...ISSUES.server]
+          .sort((a, b) => b.daysSinceUpdate - a.daysSinceUpdate)
+      : [];
+    const staleIssues = openIssues.filter((i) => i.daysSinceUpdate >= 30);
     const inFlight = [
       ...DATA.web.map((b) => ({ ...b, side: "web" })),
       ...DATA.server.map((b) => ({ ...b, side: "server" })),
@@ -1103,6 +1420,12 @@
       drift,
       mergeOrder,
       bottlenecks,
+      readyToShip,
+      tentative,
+      blocked,
+      openIssuesCount: openIssues.length,
+      staleIssuesCount: staleIssues.length,
+      issuesAvailable: ISSUES.available,
     };
   }
 
@@ -1139,14 +1462,73 @@
       html += shippedSectionHTML("server", d.shipped.server, REPOS.server);
     }
 
+    html += `<h2>Ready to ship <span class="count">${d.readyToShip.length} green + tested</span></h2>`;
+    if (d.readyToShip.length === 0) {
+      html += `<div class="digest-empty">Nothing currently green + tested. Get CI passing on a branch with new tests to land one here.</div>`;
+    } else {
+      for (const b of d.readyToShip) {
+        const r = b.readiness || { label: "ready" };
+        html += `<div class="digest-row ${b.side}">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">${escAttr(b.name)}</span>`;
+        html += `<span class="row-meta">${escAttr(r.label)} · last ${b.last}</span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">${escAttr(b.synth)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    if (d.tentative.length > 0) {
+      html += `<h2>Likely shippable <span class="count">${d.tentative.length}</span></h2>`;
+      for (const b of d.tentative) {
+        const r = b.readiness || { label: "" };
+        html += `<div class="digest-row ${b.side}">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">${escAttr(b.name)}</span>`;
+        html += `<span class="row-meta">${escAttr(r.label)} · last ${b.last}</span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">${escAttr(b.synth)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    if (d.blocked.length > 0) {
+      html += `<h2>Blocked from rollout <span class="count">${d.blocked.length}</span></h2>`;
+      for (const b of d.blocked) {
+        const r = b.readiness || { label: "blocked" };
+        const cls = r.verdict === "failing" ? "risk" : "warn";
+        html += `<div class="digest-row ${cls}">`;
+        html += `<div class="row-top">`;
+        html += `<span class="row-branch">${escAttr(b.name)}</span>`;
+        html += `<span class="row-meta">${escAttr(r.label)}</span>`;
+        html += `</div>`;
+        html += `<div class="row-summary">${escAttr(b.synth)}</div>`;
+        html += `</div>`;
+      }
+    }
+
+    if (d.issuesAvailable) {
+      html += `<h2>Open issues <span class="count">${d.openIssuesCount}${d.staleIssuesCount > 0 ? ` · ${d.staleIssuesCount} stale` : ""}</span></h2>`;
+      if (d.openIssuesCount === 0) {
+        html += `<div class="digest-empty">Inbox zero across both repos.</div>`;
+      } else {
+        const note = d.staleIssuesCount > 0
+          ? `<div class="digest-empty" style="color:var(--stale);border-color:rgba(245,158,11,0.4);background:rgba(245,158,11,0.04)">${d.staleIssuesCount} issue${d.staleIssuesCount === 1 ? "" : "s"} haven't been updated in over a month.</div>`
+          : `<div class="digest-empty">All open issues have been touched within the last 30 days.</div>`;
+        html += note;
+      }
+    }
+
     html += `<h2>In flight <span class="count">${d.inFlight.length} active</span></h2>`;
     if (d.inFlight.length === 0) html += `<div class="digest-empty">No active branches.</div>`;
     else {
       for (const b of d.inFlight) {
+        const li = (b.linkedIssues || []).filter(Boolean);
+        const linkLabel = li.length > 0 ? ` · ⊕ ${li.length} issue${li.length === 1 ? "" : "s"}` : "";
         html += `<div class="digest-row ${b.side}">`;
         html += `<div class="row-top">`;
         html += `<span class="row-branch">${escAttr(b.name)}</span>`;
-        html += `<span class="row-meta"><span class="ahead">↑${b.ahead}</span><span class="behind">↓${b.behind}</span>${b.last}${(b.authors || []).length ? ` · @${(b.authors || []).join(", ")}` : ""}</span>`;
+        html += `<span class="row-meta"><span class="ahead">↑${b.ahead}</span><span class="behind">↓${b.behind}</span>${b.last}${(b.authors || []).length ? ` · @${(b.authors || []).join(", ")}` : ""}${linkLabel}</span>`;
         html += `</div>`;
         html += `<div class="row-summary">${escAttr(b.synth)}</div>`;
         html += `</div>`;
@@ -1234,6 +1616,36 @@
         }
       }
     }
+    lines.push(``);
+    lines.push(`## Ready to ship · green + tested`);
+    if (d.readyToShip.length === 0) lines.push(`_Nothing currently green + tested._`);
+    else
+      for (const b of d.readyToShip) {
+        lines.push(`- **[${b.side}]** \`${b.name}\` — ${b.readiness.label}. ${b.synth}`);
+      }
+
+    if (d.tentative.length > 0) {
+      lines.push(``);
+      lines.push(`## Likely shippable`);
+      for (const b of d.tentative) {
+        lines.push(`- **[${b.side}]** \`${b.name}\` — ${b.readiness.label}. ${b.synth}`);
+      }
+    }
+
+    if (d.blocked.length > 0) {
+      lines.push(``);
+      lines.push(`## Blocked from rollout`);
+      for (const b of d.blocked) {
+        lines.push(`- **[${b.side}]** \`${b.name}\` — ${b.readiness.label}`);
+      }
+    }
+
+    if (d.issuesAvailable) {
+      lines.push(``);
+      lines.push(`## Open issues`);
+      lines.push(`- ${d.openIssuesCount} open${d.staleIssuesCount > 0 ? ` · ${d.staleIssuesCount} stale (>30 days untouched)` : ""}`);
+    }
+
     lines.push(``);
     lines.push(`## In flight`);
     if (d.inFlight.length === 0) lines.push(`_No active branches._`);
@@ -1424,11 +1836,17 @@
 
   /* ══════════════ Boot ══════════════ */
   function boot() {
-    // Fill legend-pill labels with real repo names
+    // Fill legend-pill labels with real repo names + issue counts
+    const issueCounts = { web: ISSUES.web.length, server: ISSUES.server.length };
     document.querySelectorAll(".legend-pills .pill").forEach((pill, i) => {
+      const side = i === 0 ? "web" : "server";
       const name = i === 0 ? REPOS.web : REPOS.server;
       const dotCls = i === 0 ? "web" : "server";
-      pill.innerHTML = `<span class="dot ${dotCls}"></span> ${name}`;
+      const issueLabel =
+        ISSUES.available && issueCounts[side] > 0
+          ? ` <span style="color:var(--muted);margin-left:6px">· ${issueCounts[side]} open</span>`
+          : "";
+      pill.innerHTML = `<span class="dot ${dotCls}"></span> ${name}${issueLabel}`;
     });
     document.getElementById("trunk-label-web").innerHTML =
       `<span class="dot web"></span> <strong>${REPOS.web}</strong> · develop`;
@@ -1441,6 +1859,8 @@
     renderDrift();
     renderHistory();
     renderShared();
+    renderIssueLabelChips();
+    renderIssues();
     // Center "now" on both scrollable panels on first render
     requestAnimationFrame(() => {
       scrollAllToNow();

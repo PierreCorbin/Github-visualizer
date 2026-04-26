@@ -39,6 +39,7 @@ const APP_HTML = `
 
   <!-- ───────── Insight strip ───────── -->
   <section class="insights" id="insights"></section>
+  <div id="ci-coverage-hint" class="hint-banner" style="display:none"></div>
 
   <!-- ───────── Main visualization ───────── -->
   <section class="viz">
@@ -72,6 +73,30 @@ const APP_HTML = `
         <svg class="paths" id="paths" xmlns="http://www.w3.org/2000/svg"></svg>
       </div>
     </div>
+  </section>
+
+  <!-- ───────── Issues hub ───────── -->
+  <section class="issues">
+    <div class="issues-head">
+      <div>
+        <h2>Issues · open across both repos</h2>
+        <p class="sub">Filter, search, and click into any issue to see which branches are working on it. Issues link automatically when a PR body contains <code>Closes #N</code>, <code>Fixes #N</code>, or <code>Resolves #N</code>.</p>
+      </div>
+      <div class="issues-toolbar">
+        <input type="search" id="issues-search" class="issues-search" placeholder="Search title / number…" autocomplete="off"/>
+        <div class="issues-controls" id="issues-side-controls">
+          <button class="active" data-issue-side="all">All</button>
+          <button data-issue-side="web">Web</button>
+          <button data-issue-side="server">Server</button>
+        </div>
+      </div>
+    </div>
+    <div class="issues-meta-row">
+      <div class="issues-stats" id="issues-stats">—</div>
+      <div class="issues-label-chips" id="issues-label-chips"></div>
+    </div>
+    <div class="issues-grid" id="issues-grid"></div>
+    <div class="issues-empty" id="issues-empty" style="display:none"></div>
   </section>
 
   <!-- ───────── Contract drift ───────── -->
@@ -142,6 +167,18 @@ const APP_HTML = `
       </button>
     </div>
     <div class="modal-body" id="feature-modal-body"></div>
+  </div>
+</div>
+
+<div class="modal-backdrop" id="issue-modal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3 id="issue-modal-title">Issue</h3>
+      <button class="close" data-close="issue-modal" aria-label="Close">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body" id="issue-modal-body"></div>
   </div>
 </div>
 

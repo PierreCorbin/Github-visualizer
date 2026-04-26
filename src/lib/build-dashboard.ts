@@ -1,19 +1,29 @@
 import "server-only";
 import {
   compareBranches,
+  getCheckRuns,
+  getCombinedStatus,
   getRepoMeta,
   listBranches,
   listCommits,
+  listIssues,
   listPulls,
   listRecentMainCommits,
   listRecentReleases,
+  type GhCheck,
+  type GhCombinedStatus,
   type GhCommit,
+  type GhIssue,
   type GhPull,
 } from "./github";
 import { readPlan, backendLabel, type RoadmapPlan } from "./roadmap-store";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = () => Date.now();
+
+export type CiState = "success" | "pending" | "failure" | "none";
+export type TestVerdict = "has-tests" | "tests-unchanged" | "no-src-changes";
+export type ReadinessVerdict = "ready" | "ship-able" | "failing" | "pending" | "unknown";
 
 export type BranchNode = {
   id: string;
@@ -35,6 +45,30 @@ export type BranchNode = {
   issue: { sys: string; id: string; title: string; status: string } | null;
   topFiles: string[];
   url: string;
+  // Rollout readiness
+  ci: { state: CiState; total: number; failing: string[]; passing: string[]; url: string | null };
+  testSignal: { verdict: TestVerdict; src: number; tests: number };
+  readiness: { verdict: ReadinessVerdict; label: string };
+  // Cross-link to issues
+  linkedIssues: number[];
+};
+
+export type IssueNode = {
+  number: number;
+  side: "web" | "server";
+  title: string;
+  url: string;
+  state: "open" | "closed";
+  labels: { name: string; color: string }[];
+  assignees: { login: string; avatar: string | null }[];
+  author: { login: string; avatar: string | null };
+  daysOld: number;
+  daysSinceUpdate: number;
+  body: string;
+  // Branches that reference this issue (via PR body or branch name)
+  linkedBranches: { id: string; side: "web" | "server"; name: string; stage: string }[];
+  // Convenience: linked open PR number if any
+  linkedPRs: number[];
 };
 
 export type HistoryNode = {
@@ -68,6 +102,12 @@ export type DashboardPayload = {
   history: { web: HistoryNode[]; server: HistoryNode[] };
   contractDrift: DriftCard[];
   deploys: { web: number[]; server: number[] };
+  issues: {
+    web: IssueNode[];
+    server: IssueNode[];
+    topLabels: string[];
+    available: boolean; // false when the token lacks issues:read on either repo
+  };
   plan: RoadmapPlan;
   planBackend: "vercel-kv" | "local-file";
   isProd: boolean;
@@ -140,6 +180,125 @@ function stageFromAge(days: number, ahead: number, behind: number): "active" | "
   if (days > 90) return "abandoned";
   if (days > 14 || (behind > 0 && ahead === 0)) return "stale";
   return "active";
+}
+
+/* ════════════ Flexible test-file detection ════════════ */
+// Any of these signals classifies a file as a test. Designed to work across
+// JS, TS, Go, Python, Ruby, Rust, Vue, Svelte etc. without configuration.
+const TEST_PATH_RE = /(^|\/)(__tests__|tests?|specs?|cypress|playwright|e2e)\//i;
+const TEST_FILENAME_RE = /\.(test|spec)\.[a-z0-9]+$|_test\.go$|_spec\.rb$/i;
+const SOURCE_EXT_RE = /\.(ts|tsx|js|jsx|mjs|cjs|go|py|rb|rs|java|kt|vue|svelte|cs|php|ex|exs|sql|graphql|html?|hbs|ejs|liquid|css|scss|less)$/i;
+const IGNORED_EXT_RE = /\.(md|markdown|txt|json|ya?ml|lock|toml|env|gitignore|editorconfig|csv|pdf|png|jpg|jpeg|svg|gif|webp|ico|woff2?|ttf)$|(^|\/)\.[^/]+$|Dockerfile|Makefile/i;
+
+function isTestFile(path: string): boolean {
+  return TEST_PATH_RE.test(path) || TEST_FILENAME_RE.test(path);
+}
+function isSourceFile(path: string): boolean {
+  if (isTestFile(path)) return false;
+  if (IGNORED_EXT_RE.test(path)) return false;
+  return SOURCE_EXT_RE.test(path);
+}
+function computeTestSignal(files: { filename: string }[]): BranchNode["testSignal"] {
+  let src = 0;
+  let tests = 0;
+  for (const f of files) {
+    if (isTestFile(f.filename)) tests++;
+    else if (isSourceFile(f.filename)) src++;
+  }
+  if (src === 0 && tests === 0) return { verdict: "no-src-changes", src: 0, tests: 0 };
+  if (src === 0) return { verdict: "no-src-changes", src: 0, tests };
+  if (tests === 0) return { verdict: "tests-unchanged", src, tests: 0 };
+  return { verdict: "has-tests", src, tests };
+}
+
+/* ════════════ CI status merge (check-runs + legacy combined status) ════════════ */
+function mergeCiSignal(
+  combined: GhCombinedStatus | null,
+  checks: GhCheck[],
+  repoUrl: string,
+  sha: string,
+): BranchNode["ci"] {
+  const failing: string[] = [];
+  const passing: string[] = [];
+  let hasPending = false;
+  let hasFailure = false;
+  let hasSuccess = false;
+
+  // Modern check-runs
+  for (const c of checks) {
+    if (c.status !== "completed") {
+      hasPending = true;
+      continue;
+    }
+    const conc = c.conclusion ?? "";
+    if (conc === "failure" || conc === "timed_out" || conc === "action_required") {
+      hasFailure = true;
+      failing.push(c.name);
+    } else if (conc === "success") {
+      hasSuccess = true;
+      passing.push(c.name);
+    } else if (conc === "cancelled") {
+      // Neither pass nor fail — flag as failure-ish since it didn't complete
+      hasFailure = true;
+      failing.push(c.name + " (cancelled)");
+    }
+    // neutral/skipped are treated as non-blocking
+  }
+
+  // Legacy commit status
+  if (combined && combined.total_count > 0) {
+    for (const s of combined.statuses) {
+      if (s.state === "pending") hasPending = true;
+      else if (s.state === "failure" || s.state === "error") {
+        hasFailure = true;
+        if (!failing.includes(s.context)) failing.push(s.context);
+      } else if (s.state === "success") {
+        hasSuccess = true;
+        if (!passing.includes(s.context)) passing.push(s.context);
+      }
+    }
+  }
+
+  const total = checks.length + (combined?.total_count ?? 0);
+  const url = `${repoUrl}/commit/${sha}/checks`;
+  let state: CiState;
+  if (total === 0) state = "none";
+  else if (hasFailure) state = "failure";
+  else if (hasPending) state = "pending";
+  else if (hasSuccess) state = "success";
+  else state = "none";
+
+  return { state, total, failing, passing, url: total > 0 ? url : null };
+}
+
+function readinessFrom(ci: BranchNode["ci"], ts: BranchNode["testSignal"]): BranchNode["readiness"] {
+  if (ci.state === "failure") {
+    const failingCount = ci.failing.length;
+    return { verdict: "failing", label: failingCount > 0 ? `CI red · ${failingCount} failing` : "CI red" };
+  }
+  if (ci.state === "pending") return { verdict: "pending", label: "CI running" };
+  if (ci.state === "none") {
+    if (ts.verdict === "has-tests") return { verdict: "ship-able", label: "No CI · tests present" };
+    if (ts.verdict === "no-src-changes") return { verdict: "unknown", label: "No code changes" };
+    return { verdict: "unknown", label: "No CI · no new tests" };
+  }
+  // CI success
+  if (ts.verdict === "has-tests") return { verdict: "ready", label: "Ready · green + tests" };
+  if (ts.verdict === "no-src-changes") return { verdict: "ship-able", label: "Green · no code changes" };
+  return { verdict: "ship-able", label: "Green · no new tests" };
+}
+
+/* ════════════ Issue ↔ branch linking ════════════ */
+const CLOSING_KEYWORD_RE =
+  /\b(close[sd]?|fix(es|ed)?|resolve[sd]?)\b[: ]*#(\d+)/gi;
+function extractLinkedIssueNumbers(prBody: string, branchName: string): Set<number> {
+  const out = new Set<number>();
+  if (prBody) {
+    for (const m of prBody.matchAll(CLOSING_KEYWORD_RE)) out.add(Number(m[3]));
+  }
+  // Also pick up #123 in branch names (rare but sometimes used)
+  for (const m of branchName.matchAll(/#(\d+)/g)) out.add(Number(m[1]));
+  return out;
 }
 
 function buildCommits14(commits: GhCommit[]): number[] {
@@ -250,12 +409,18 @@ async function buildForRepo(repo: string, side: "web" | "server"): Promise<{
   branches: BranchNode[];
   history: HistoryNode[];
   deploys: number[];
+  issuesRaw: GhIssue[];
+  issuesAvailable: boolean;
+  pullsAll: GhPull[];
 }> {
-  const [meta, branchesRaw, pullsAll] = await Promise.all([
+  const [meta, branchesRaw, pullsAll, issuesMaybe] = await Promise.all([
     getRepoMeta(repo),
     listBranches(repo),
     listPulls(repo),
+    listIssues(repo, "open"),
   ]);
+  const issuesAvailable = issuesMaybe !== null;
+  const issuesRaw = issuesMaybe ?? [];
   const defaultBranch = "develop"; // Flash convention; falls back to compare errors if missing
   const hasDevelop = branchesRaw.some((b) => b.name === defaultBranch);
   const base = hasDevelop ? defaultBranch : (meta.default_branch as string);
@@ -266,19 +431,22 @@ async function buildForRepo(repo: string, side: "web" | "server"): Promise<{
     .map((b) => b.name)
     .filter((n) => categorize(n) === "feature");
   const namesToFetch = Array.from(new Set([...pickNames, ...featureNames])).slice(0, 14);
+  const shaByName = new Map(branchesRaw.map((b) => [b.name, b.sha]));
 
-  const compared = await Promise.all(
+  // Parallelize compare + CI fetch per branch
+  const perBranch = await Promise.all(
     namesToFetch.map(async (name) => {
-      try {
-        const cmp = await compareBranches(repo, base, name);
-        return { name, cmp };
-      } catch {
-        return { name, cmp: null };
-      }
+      const sha = shaByName.get(name);
+      const [cmpRes, combined, checks] = await Promise.all([
+        compareBranches(repo, base, name).catch(() => null),
+        sha ? getCombinedStatus(repo, sha) : Promise.resolve(null),
+        sha ? getCheckRuns(repo, sha) : Promise.resolve([] as GhCheck[]),
+      ]);
+      return { name, sha, cmp: cmpRes, combined, checks };
     }),
   );
 
-  const nodes: BranchNode[] = compared.map(({ name, cmp }, idx) => {
+  const nodes: BranchNode[] = perBranch.map(({ name, sha, cmp, combined, checks }, idx) => {
     const commits = cmp?.commits ?? [];
     const lastCommit = commits[commits.length - 1] ?? null;
     const ago = humanAgo(lastCommit?.author.date);
@@ -311,6 +479,19 @@ async function buildForRepo(repo: string, side: "web" | "server"): Promise<{
 
     const stage = stageFromAge(ago.days, cmp?.ahead_by ?? 0, cmp?.behind_by ?? 0);
 
+    // CI + tests + readiness
+    const ci = sha
+      ? mergeCiSignal(combined, checks, meta.html_url, sha)
+      : { state: "none" as CiState, total: 0, failing: [], passing: [], url: null };
+    const testSignal = computeTestSignal(files);
+    const readiness = readinessFrom(ci, testSignal);
+
+    // Linked issues — from PR body + branch name. Filtered later against the
+    // actual open-issue list in the dashboard assembler.
+    const linkedIssues = Array.from(
+      extractLinkedIssueNumbers(pr?.body ?? "", name),
+    );
+
     return {
       id: `${side[0]}-${idx}-${name.replace(/[^a-z0-9]/gi, "-").toLowerCase()}`,
       side,
@@ -323,14 +504,18 @@ async function buildForRepo(repo: string, side: "web" | "server"): Promise<{
       last: ago.label,
       lastDays: Math.round(ago.days * 10) / 10,
       files: files.length,
-      filesStart: files.length, // approximation: GitHub doesn't cheaply expose "scope at branch creation"
+      filesStart: files.length,
       author: lastCommit ? initialsOf(lastCommit.author.name, lastCommit.author.login) : "??",
       authors: authorsInit,
       commits14: buildCommits14(commits),
       pr: prObj,
-      issue: null, // could be parsed from PR body; skipping to avoid noise
+      issue: null,
       topFiles,
       url: `${meta.html_url}/tree/${encodeURIComponent(name)}`,
+      ci,
+      testSignal,
+      readiness,
+      linkedIssues,
     };
   });
 
@@ -383,7 +568,71 @@ async function buildForRepo(repo: string, side: "web" | "server"): Promise<{
     .filter((d) => d >= 0 && d <= 30)
     .slice(0, 10);
 
-  return { meta, branches: nodes, history, deploys };
+  return { meta, branches: nodes, history, deploys, issuesRaw, issuesAvailable, pullsAll };
+}
+
+/* ════════════ Build rich issue nodes with cross-links ════════════ */
+function buildIssueNodes(
+  issuesRaw: GhIssue[],
+  side: "web" | "server",
+  pullsAll: GhPull[],
+  branchesBothSides: BranchNode[],
+): IssueNode[] {
+  // Pre-index: which branch IDs reference which issue numbers?
+  const issueToBranches = new Map<number, BranchNode[]>();
+  for (const b of branchesBothSides) {
+    for (const n of b.linkedIssues || []) {
+      if (!issueToBranches.has(n)) issueToBranches.set(n, []);
+      issueToBranches.get(n)!.push(b);
+    }
+  }
+  // Pre-index: which issue numbers are referenced by which PR?
+  const issueToPRs = new Map<number, number[]>();
+  for (const p of pullsAll) {
+    const nums = extractLinkedIssueNumbers(p.body ?? "", p.head ?? "");
+    for (const n of nums) {
+      if (!issueToPRs.has(n)) issueToPRs.set(n, []);
+      issueToPRs.get(n)!.push(p.number);
+    }
+  }
+
+  return issuesRaw.map((i) => {
+    const created = new Date(i.createdAt).getTime();
+    const updated = new Date(i.updatedAt).getTime();
+    const linkedBranches = (issueToBranches.get(i.number) ?? []).map((b) => ({
+      id: b.id,
+      side: b.side,
+      name: b.name,
+      stage: b.stage,
+    }));
+    const linkedPRs = issueToPRs.get(i.number) ?? [];
+    return {
+      number: i.number,
+      side,
+      title: i.title,
+      url: i.url,
+      state: i.state,
+      labels: i.labels,
+      assignees: i.assignees,
+      author: i.user,
+      daysOld: Math.round((NOW() - created) / DAY_MS),
+      daysSinceUpdate: Math.round((NOW() - updated) / DAY_MS),
+      body: (i.body ?? "").slice(0, 600),
+      linkedBranches,
+      linkedPRs,
+    };
+  });
+}
+
+function topLabelsFromIssues(issues: IssueNode[], maxLabels = 8): string[] {
+  const count = new Map<string, number>();
+  for (const i of issues) {
+    for (const l of i.labels) count.set(l.name, (count.get(l.name) ?? 0) + 1);
+  }
+  return [...count.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([name]) => name)
+    .slice(0, maxLabels);
 }
 
 export async function buildFullDashboard(): Promise<DashboardPayload> {
@@ -417,6 +666,19 @@ export async function buildFullDashboard(): Promise<DashboardPayload> {
     const nonFeatures = arr.filter((b) => !b.feature).sort((a, b) => rank(a) - rank(b));
     return [...features, ...nonFeatures].slice(0, 6);
   };
+  const webBranches = featureFirst(webSide.branches);
+  const serverBranches = featureFirst(serverSide.branches);
+
+  // Issue nodes — pass ALL branches both sides so we link issues correctly.
+  const allBranches = [...webSide.branches, ...serverSide.branches];
+  const webIssues = buildIssueNodes(webSide.issuesRaw, "web", webSide.pullsAll, allBranches);
+  const serverIssues = buildIssueNodes(
+    serverSide.issuesRaw,
+    "server",
+    serverSide.pullsAll,
+    allBranches,
+  );
+  const topLabels = topLabelsFromIssues([...webIssues, ...serverIssues], 10);
 
   return {
     repos: {
@@ -427,8 +689,8 @@ export async function buildFullDashboard(): Promise<DashboardPayload> {
     },
     generatedAt: new Date().toISOString(),
     data: {
-      web: featureFirst(webSide.branches),
-      server: featureFirst(serverSide.branches),
+      web: webBranches,
+      server: serverBranches,
     },
     history: {
       web: webSide.history,
@@ -438,6 +700,12 @@ export async function buildFullDashboard(): Promise<DashboardPayload> {
     deploys: {
       web: webSide.deploys,
       server: serverSide.deploys,
+    },
+    issues: {
+      web: webIssues,
+      server: serverIssues,
+      topLabels,
+      available: webSide.issuesAvailable && serverSide.issuesAvailable,
     },
     plan,
     planBackend: backendLabel(),
